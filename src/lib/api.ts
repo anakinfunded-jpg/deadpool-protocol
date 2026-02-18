@@ -152,7 +152,7 @@ export async function getStats(): Promise<Stats> {
 }
 
 export async function getDeaths(filter: string = "ALL"): Promise<Token[]> {
-  const res = await fetch(`${API_URL}/api/deaths?status=${filter}`);
+  const res = await fetch(`${API_URL}/api/deaths?status=${filter}&limit=200`);
   if (!res.ok) throw new Error("Failed to fetch deaths");
   const d: { tokens: ApiToken[]; count: number } = await res.json();
   return d.tokens.map(transformToken);
@@ -160,7 +160,7 @@ export async function getDeaths(filter: string = "ALL"): Promise<Token[]> {
 
 export async function getZombies(sort: string = "score"): Promise<Token[]> {
   const apiSort = sort === "score" ? "zombie_score" : sort;
-  const res = await fetch(`${API_URL}/api/zombies?sort=${apiSort}`);
+  const res = await fetch(`${API_URL}/api/zombies?sort=${apiSort}&limit=200`);
   if (!res.ok) throw new Error("Failed to fetch zombies");
   const d: { zombies: ApiToken[]; count: number } = await res.json();
   return d.zombies.map(transformToken);

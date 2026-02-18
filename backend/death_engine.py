@@ -45,7 +45,7 @@ from flask_cors import CORS
 MORALIS_API_KEY = os.environ.get("MORALIS_API_KEY", "YOUR_MORALIS_API_KEY")
 MORALIS_BASE = "https://solana-gateway.moralis.io"
 DB_PATH = "deadpool.db"
-SCAN_INTERVAL_SECONDS = 900  # 15 minutes
+SCAN_INTERVAL_SECONDS = 90  # 90 seconds for near-real-time tracking
 LOG_LEVEL = logging.INFO
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -142,6 +142,22 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_votes_proposal ON cto_votes(proposal_id);
     """)
     conn.commit()
+
+    # Idempotent migrations — add columns that may not exist yet
+    migrations = [
+        ("tokens", "graduated_at", "ALTER TABLE tokens ADD COLUMN graduated_at TEXT"),
+        ("tokens", "bonding_progress", "ALTER TABLE tokens ADD COLUMN bonding_progress REAL DEFAULT 0"),
+    ]
+    for table, col, sql in migrations:
+        try:
+            conn.execute(sql)
+            logger.info(f"Migration: added {table}.{col}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+    # Extra index for graduated_at
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_graduated_at ON tokens(graduated_at)")
+    conn.commit()
     conn.close()
     logger.info("Database initialized")
 
@@ -206,6 +222,38 @@ class MoralisClient:
             logger.error(f"Failed to fetch metadata for {address}: {e}")
             return None
     
+    def get_graduated_tokens(self, limit: int = 100, cursor: str = None) -> tuple:
+        """Fetch pump.fun tokens that completed bonding (graduated).
+        Returns (results_list, next_cursor)."""
+        url = f"{MORALIS_BASE}/token/mainnet/exchange/pumpfun/graduated"
+        params = {"limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            resp = self.session.get(url, params=params, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("result", []), data.get("cursor")
+        except Exception as e:
+            logger.error(f"Failed to fetch graduated tokens: {e}")
+            return [], None
+
+    def get_bonding_tokens(self, limit: int = 100, cursor: str = None) -> tuple:
+        """Fetch pump.fun tokens currently in bonding phase.
+        Returns (results_list, next_cursor)."""
+        url = f"{MORALIS_BASE}/token/mainnet/exchange/pumpfun/bonding"
+        params = {"limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            resp = self.session.get(url, params=params, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("result", []), data.get("cursor")
+        except Exception as e:
+            logger.error(f"Failed to fetch bonding tokens: {e}")
+            return [], None
+
     def get_token_pairs(self, address: str) -> Optional[dict]:
         """Fetch token pair/liquidity data."""
         url = f"{MORALIS_BASE}/token/mainnet/{address}/pairs"
@@ -501,6 +549,218 @@ class TokenScanner:
         logger.info(f"Scan complete: {scanned} tokens, {deaths} deaths, {zombies} zombies")
         return scanned, deaths, zombies
     
+    def scan_graduated_tokens(self, limit: int = 100, max_pages: int = 5):
+        """Fetch and process graduated (bonded) pump.fun tokens with cursor pagination."""
+        logger.info(f"Scanning graduated tokens (max {max_pages} pages of {limit})...")
+        cursor = None
+        total_scanned = 0
+        total_deaths = 0
+        total_zombies = 0
+
+        conn = get_db()
+        for page in range(max_pages):
+            tokens, cursor = self.client.get_graduated_tokens(limit=limit, cursor=cursor)
+            if not tokens:
+                break
+
+            for token in tokens:
+                try:
+                    address = token.get("tokenAddress", "")
+                    if not address:
+                        continue
+
+                    price_usd = float(token.get("priceUsd") or token.get("usdPrice") or 0)
+                    liquidity = float(token.get("liquidity") or token.get("liquidityUsd") or 0)
+                    fdv = float(token.get("fullyDilutedValuation") or 0)
+                    volume_24h = float(token.get("24hrVolume") or token.get("volume24h") or 0)
+                    graduated_at = token.get("graduatedAt") or token.get("createdAt")
+
+                    token_data = {
+                        "address": address,
+                        "name": token.get("name", "Unknown"),
+                        "symbol": token.get("symbol", "???"),
+                        "logo": token.get("logo") or token.get("image"),
+                        "created_at": token.get("createdAt"),
+                        "price_usd": price_usd,
+                        "price_native": float(token.get("priceNative", 0) or 0),
+                        "liquidity_usd": liquidity,
+                        "fully_diluted_value": fdv,
+                        "volume_24h": volume_24h,
+                        "holder_count": int(token.get("holders", 0) or 0),
+                        "creator_active": price_usd > 0 or volume_24h > 0,
+                        "peak_mcap": fdv,
+                    }
+
+                    health = self.scorer.calculate_health(token_data)
+                    token_data.update(health)
+
+                    conn.execute("""
+                        INSERT INTO tokens (
+                            address, name, symbol, logo, created_at,
+                            price_usd, price_native, liquidity_usd, fully_diluted_value,
+                            volume_24h, health_score, status, zombie_score, death_cause,
+                            peak_mcap, holder_count, graduated_at, bonding_progress,
+                            last_updated
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 100, datetime('now'))
+                        ON CONFLICT(address) DO UPDATE SET
+                            price_usd = excluded.price_usd,
+                            price_native = excluded.price_native,
+                            liquidity_usd = excluded.liquidity_usd,
+                            fully_diluted_value = excluded.fully_diluted_value,
+                            volume_24h = excluded.volume_24h,
+                            health_score = excluded.health_score,
+                            status = excluded.status,
+                            zombie_score = excluded.zombie_score,
+                            death_cause = excluded.death_cause,
+                            holder_count = excluded.holder_count,
+                            peak_mcap = MAX(tokens.peak_mcap, excluded.peak_mcap),
+                            graduated_at = COALESCE(tokens.graduated_at, excluded.graduated_at),
+                            bonding_progress = 100,
+                            last_updated = datetime('now'),
+                            died_at = CASE
+                                WHEN tokens.status NOT IN ('DEAD', 'ZOMBIE') AND excluded.status IN ('DEAD', 'ZOMBIE')
+                                THEN datetime('now')
+                                ELSE tokens.died_at
+                            END
+                    """, (
+                        address, token_data["name"], token_data["symbol"], token_data["logo"],
+                        token_data["created_at"], token_data["price_usd"], token_data["price_native"],
+                        token_data["liquidity_usd"], token_data["fully_diluted_value"],
+                        token_data["volume_24h"],
+                        health["health_score"], health["status"], health["zombie_score"],
+                        health["death_cause"], token_data["peak_mcap"],
+                        token_data["holder_count"], graduated_at,
+                    ))
+
+                    total_scanned += 1
+                    if health["status"] == "DEAD":
+                        total_deaths += 1
+                    elif health["status"] == "ZOMBIE":
+                        total_zombies += 1
+
+                except Exception as e:
+                    logger.error(f"Error processing graduated token {token.get('tokenAddress', '?')}: {e}")
+                    continue
+
+            conn.commit()
+            logger.info(f"  Graduated page {page + 1}: {len(tokens)} tokens")
+            if not cursor:
+                break
+
+        # Log scan result
+        conn.execute(
+            "INSERT INTO scan_history (tokens_scanned, deaths_found, zombies_found) VALUES (?, ?, ?)",
+            (total_scanned, total_deaths, total_zombies)
+        )
+        conn.commit()
+        conn.close()
+
+        logger.info(f"Graduated scan complete: {total_scanned} tokens, {total_deaths} deaths, {total_zombies} zombies")
+        return total_scanned, total_deaths, total_zombies
+
+    def scan_bonding_tokens(self, limit: int = 100, max_pages: int = 5):
+        """Fetch and process tokens currently in bonding phase."""
+        logger.info(f"Scanning bonding tokens (max {max_pages} pages of {limit})...")
+        cursor = None
+        total_scanned = 0
+
+        conn = get_db()
+        for page in range(max_pages):
+            tokens, cursor = self.client.get_bonding_tokens(limit=limit, cursor=cursor)
+            if not tokens:
+                break
+
+            for token in tokens:
+                try:
+                    address = token.get("tokenAddress", "")
+                    if not address:
+                        continue
+
+                    price_usd = float(token.get("priceUsd") or token.get("usdPrice") or 0)
+                    liquidity = float(token.get("liquidity") or token.get("liquidityUsd") or 0)
+                    fdv = float(token.get("fullyDilutedValuation") or 0)
+                    bonding_progress = float(token.get("bondingCurveProgress") or token.get("progress") or 0)
+
+                    token_data = {
+                        "address": address,
+                        "name": token.get("name", "Unknown"),
+                        "symbol": token.get("symbol", "???"),
+                        "logo": token.get("logo") or token.get("image"),
+                        "created_at": token.get("createdAt"),
+                        "price_usd": price_usd,
+                        "price_native": float(token.get("priceNative", 0) or 0),
+                        "liquidity_usd": liquidity,
+                        "fully_diluted_value": fdv,
+                        "volume_24h": 0,
+                        "holder_count": int(token.get("holders", 0) or 0),
+                        "creator_active": True,
+                        "peak_mcap": fdv,
+                    }
+
+                    health = self.scorer.calculate_health(token_data)
+                    token_data.update(health)
+
+                    conn.execute("""
+                        INSERT INTO tokens (
+                            address, name, symbol, logo, created_at,
+                            price_usd, price_native, liquidity_usd, fully_diluted_value,
+                            health_score, status, zombie_score, death_cause,
+                            peak_mcap, holder_count, bonding_progress, last_updated
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                        ON CONFLICT(address) DO UPDATE SET
+                            price_usd = excluded.price_usd,
+                            price_native = excluded.price_native,
+                            liquidity_usd = excluded.liquidity_usd,
+                            fully_diluted_value = excluded.fully_diluted_value,
+                            health_score = excluded.health_score,
+                            status = excluded.status,
+                            zombie_score = excluded.zombie_score,
+                            death_cause = excluded.death_cause,
+                            holder_count = excluded.holder_count,
+                            peak_mcap = MAX(tokens.peak_mcap, excluded.peak_mcap),
+                            bonding_progress = excluded.bonding_progress,
+                            last_updated = datetime('now'),
+                            died_at = CASE
+                                WHEN tokens.status NOT IN ('DEAD', 'ZOMBIE') AND excluded.status IN ('DEAD', 'ZOMBIE')
+                                THEN datetime('now')
+                                ELSE tokens.died_at
+                            END
+                    """, (
+                        address, token_data["name"], token_data["symbol"], token_data["logo"],
+                        token_data["created_at"], token_data["price_usd"], token_data["price_native"],
+                        token_data["liquidity_usd"], token_data["fully_diluted_value"],
+                        health["health_score"], health["status"], health["zombie_score"],
+                        health["death_cause"], token_data["peak_mcap"],
+                        token_data["holder_count"], bonding_progress,
+                    ))
+
+                    total_scanned += 1
+
+                except Exception as e:
+                    logger.error(f"Error processing bonding token {token.get('tokenAddress', '?')}: {e}")
+                    continue
+
+            conn.commit()
+            logger.info(f"  Bonding page {page + 1}: {len(tokens)} tokens")
+            if not cursor:
+                break
+
+        conn.close()
+        logger.info(f"Bonding scan complete: {total_scanned} tokens")
+        return total_scanned
+
+    @staticmethod
+    def _update_days_dead():
+        """Bulk-update days_dead for all DEAD/ZOMBIE tokens using died_at."""
+        conn = get_db()
+        conn.execute("""
+            UPDATE tokens
+            SET days_dead = CAST(julianday('now') - julianday(died_at) AS INTEGER)
+            WHERE status IN ('DEAD', 'ZOMBIE') AND died_at IS NOT NULL
+        """)
+        conn.commit()
+        conn.close()
+
     def check_single_token(self, address: str) -> Optional[dict]:
         """Check health of a specific token."""
         # Try to get price data
@@ -536,10 +796,26 @@ class TokenScanner:
 # BACKGROUND SCANNER THREAD
 # ============================================================
 def scanner_loop(scanner: TokenScanner):
-    """Background thread that scans tokens periodically."""
+    """Background thread that scans tokens periodically.
+    First run: bulk fetch graduated tokens (~50 pages) + bonding (5 pages).
+    Subsequent runs: incremental (2 pages graduated + 1 page bonding + 1 page new)."""
+    first_run = True
     while True:
         try:
-            scanner.scan_new_tokens(limit=100)
+            if first_run:
+                logger.info("=== FIRST RUN: bulk fetching graduated tokens ===")
+                scanner.scan_graduated_tokens(limit=100, max_pages=50)
+                scanner.scan_bonding_tokens(limit=100, max_pages=5)
+                scanner.scan_new_tokens(limit=100)
+                scanner._update_days_dead()
+                first_run = False
+                logger.info("=== FIRST RUN COMPLETE ===")
+            else:
+                logger.info("--- Incremental scan ---")
+                scanner.scan_graduated_tokens(limit=100, max_pages=2)
+                scanner.scan_bonding_tokens(limit=100, max_pages=1)
+                scanner.scan_new_tokens(limit=100)
+                scanner._update_days_dead()
         except Exception as e:
             logger.error(f"Scanner loop error: {e}")
         time.sleep(SCAN_INTERVAL_SECONDS)
@@ -553,6 +829,13 @@ CORS(app)  # Allow frontend to call API
 
 # Initialize database + services
 init_db()
+if MORALIS_API_KEY == "YOUR_MORALIS_API_KEY" or not MORALIS_API_KEY:
+    logger.warning("=" * 60)
+    logger.warning("  MORALIS_API_KEY is NOT set!")
+    logger.warning("  The scanner will not fetch any tokens.")
+    logger.warning("  Set it via: export MORALIS_API_KEY='your_key_here'")
+    logger.warning("=" * 60)
+
 moralis = MoralisClient(MORALIS_API_KEY)
 scanner = TokenScanner(moralis)
 
@@ -666,7 +949,7 @@ def api_metrics():
 @app.route("/api/deaths", methods=["GET"])
 def api_deaths():
     """Get tokens by status. 'ALL' returns all tokens, not just dead/zombie."""
-    limit = min(int(request.args.get("limit", 50)), 200)
+    limit = min(int(request.args.get("limit", 200)), 500)
     status_filter = request.args.get("status", "ALL").upper()
 
     conn = get_db()
@@ -692,7 +975,7 @@ def api_deaths():
 @app.route("/api/zombies", methods=["GET"])
 def api_zombies():
     """Get Zombie Index — ranked dead tokens by revival potential."""
-    limit = min(int(request.args.get("limit", 50)), 200)
+    limit = min(int(request.args.get("limit", 200)), 500)
     sort = request.args.get("sort", "zombie_score")
     
     valid_sorts = {"zombie_score": "zombie_score DESC", "holders": "holder_count DESC", "liquidity": "liquidity_usd DESC", "peak_mcap": "peak_mcap DESC"}
@@ -730,8 +1013,15 @@ def api_token(address: str):
 @app.route("/api/scan", methods=["POST"])
 def api_trigger_scan():
     """Manually trigger a scan (for development)."""
-    scanned, deaths, zombies = scanner.scan_new_tokens(limit=100)
-    return jsonify({"scanned": scanned, "deaths": deaths, "zombies": zombies})
+    g_scanned, g_deaths, g_zombies = scanner.scan_graduated_tokens(limit=100, max_pages=2)
+    b_scanned = scanner.scan_bonding_tokens(limit=100, max_pages=1)
+    n_scanned, n_deaths, n_zombies = scanner.scan_new_tokens(limit=100)
+    scanner._update_days_dead()
+    return jsonify({
+        "graduated": {"scanned": g_scanned, "deaths": g_deaths, "zombies": g_zombies},
+        "bonding": {"scanned": b_scanned},
+        "new": {"scanned": n_scanned, "deaths": n_deaths, "zombies": n_zombies},
+    })
 
 
 # ============================================================
