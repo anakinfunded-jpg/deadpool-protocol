@@ -295,17 +295,19 @@ class HealthScorer:
             liquidity_score = 3
         
         # --- Activity Score (0-25) ---
+        # Activity only counts if there's ANY market signal (volume, liquidity, or holders)
+        has_market_signal = volume > 0 or liquidity > 100 or holders > 5
         activity_score = 0
-        if creator_active:
-            activity_score += 15
-        if age_days <= 1:
-            activity_score += 10  # Very new, likely still active
-        elif age_days <= 7:
-            activity_score += 7
-        elif age_days <= 30:
-            activity_score += 3
-        # Old tokens with inactive creators get 0
-        
+        if has_market_signal:
+            if creator_active:
+                activity_score += 15
+            if age_days <= 1:
+                activity_score += 10
+            elif age_days <= 7:
+                activity_score += 7
+            elif age_days <= 30:
+                activity_score += 3
+
         # --- Holder Score (0-20) ---
         holder_score = 0
         if holders > 5000:
@@ -413,22 +415,35 @@ class TokenScanner:
                 if not address:
                     continue
                 
+                # Extract base data from new tokens endpoint
+                price_usd = float(token.get("priceUsd") or token.get("usdPrice") or 0)
+                liquidity = float(token.get("liquidity") or token.get("liquidityUsd") or 0)
+                fdv = float(token.get("fullyDilutedValuation") or 0)
+
+                # Try to enrich with price endpoint for volume data (rate-limited)
+                volume_24h = 0
+                if scanned < 20:  # Only enrich first 20 to stay within rate limits
+                    price_info = self.client.get_token_price(address)
+                    if price_info:
+                        price_usd = float(price_info.get("usdPrice", 0) or price_usd)
+                        volume_24h = float(price_info.get("24hrVolume", 0) or 0)
+
                 token_data = {
                     "address": address,
                     "name": token.get("name", "Unknown"),
                     "symbol": token.get("symbol", "???"),
-                    "logo": token.get("logo"),
+                    "logo": token.get("logo") or token.get("image"),
                     "created_at": token.get("createdAt"),
-                    "price_usd": float(token.get("priceUsd", 0) or 0),
+                    "price_usd": price_usd,
                     "price_native": float(token.get("priceNative", 0) or 0),
-                    "liquidity_usd": float(token.get("liquidity", 0) or 0),
-                    "fully_diluted_value": float(token.get("fullyDilutedValuation", 0) or 0),
-                    "volume_24h": 0,  # Not available in this endpoint, need separate call
-                    "holder_count": 0,  # Would need separate call
-                    "creator_active": True,  # Default, would need chain analysis
-                    "peak_mcap": float(token.get("fullyDilutedValuation", 0) or 0),
+                    "liquidity_usd": liquidity,
+                    "fully_diluted_value": fdv,
+                    "volume_24h": volume_24h,
+                    "holder_count": int(token.get("holders", 0) or 0),
+                    "creator_active": price_usd > 0 or volume_24h > 0,
+                    "peak_mcap": fdv,
                 }
-                
+
                 # Calculate health
                 health = self.scorer.calculate_health(token_data)
                 token_data.update(health)
@@ -541,6 +556,11 @@ init_db()
 moralis = MoralisClient(MORALIS_API_KEY)
 scanner = TokenScanner(moralis)
 
+# Start background scanner thread (works under gunicorn too)
+_scanner_thread = threading.Thread(target=scanner_loop, args=(scanner,), daemon=True)
+_scanner_thread.start()
+logger.info("Background scanner started")
+
 
 @app.route("/api/health", methods=["GET"])
 def api_health():
@@ -645,20 +665,21 @@ def api_metrics():
 
 @app.route("/api/deaths", methods=["GET"])
 def api_deaths():
-    """Get recent dead/zombie tokens."""
+    """Get tokens by status. 'ALL' returns all tokens, not just dead/zombie."""
     limit = min(int(request.args.get("limit", 50)), 200)
     status_filter = request.args.get("status", "ALL").upper()
-    
+
     conn = get_db()
-    
+
+    valid_statuses = ("DEAD", "ZOMBIE", "DYING", "FADING", "ALIVE")
     if status_filter == "ALL":
         rows = conn.execute(
-            "SELECT * FROM tokens WHERE status IN ('DEAD', 'ZOMBIE') ORDER BY died_at DESC, zombie_score DESC LIMIT ?",
+            "SELECT * FROM tokens ORDER BY last_updated DESC, health_score ASC LIMIT ?",
             (limit,)
         ).fetchall()
-    elif status_filter in ("DEAD", "ZOMBIE"):
+    elif status_filter in valid_statuses:
         rows = conn.execute(
-            "SELECT * FROM tokens WHERE status = ? ORDER BY died_at DESC LIMIT ?",
+            "SELECT * FROM tokens WHERE status = ? ORDER BY last_updated DESC LIMIT ?",
             (status_filter, limit)
         ).fetchall()
     else:
@@ -861,12 +882,6 @@ def api_cto_vote():
 # MAIN
 # ============================================================
 if __name__ == "__main__":
-    # Start background scanner in a thread
-    scanner_thread = threading.Thread(target=scanner_loop, args=(scanner,), daemon=True)
-    scanner_thread.start()
-    logger.info("Background scanner started")
-    
-    # Run Flask API
     port = int(os.environ.get("PORT", 5000))
     logger.info(f"DEADPOOL Engine starting on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)

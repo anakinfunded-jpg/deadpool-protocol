@@ -47,6 +47,7 @@ export interface Token {
   peakMcap: string;
   residualLiq: string;
   zombieScore: number;
+  healthScore: number;
   status: "DEAD" | "ZOMBIE" | "ALIVE" | "FADING" | "DYING";
   deathCause: string;
 }
@@ -55,7 +56,8 @@ export interface Stats {
   scanned: number;
   deaths: number;
   zombies: number;
-  lifespan: string;
+  dying: number;
+  alive: number;
   stranded: string;
 }
 
@@ -108,17 +110,24 @@ function timeAgo(dateStr: string | null): string {
 }
 
 function transformToken(t: ApiToken): Token {
+  // For non-dead tokens, show age since creation; for dead, show time since death
+  const timeLabel =
+    t.status === "DEAD" || t.status === "ZOMBIE"
+      ? timeAgo(t.died_at)
+      : timeAgo(t.created_at);
+
   return {
     address: t.address,
     name: t.name || "Unknown",
     symbol: t.symbol || "???",
-    diedAgo: timeAgo(t.died_at),
+    diedAgo: timeLabel,
     holders: t.holder_count || 0,
     peakMcap: formatCurrency(t.peak_mcap || 0),
     residualLiq: formatCurrency(t.liquidity_usd || 0),
     zombieScore: t.zombie_score || 0,
+    healthScore: t.health_score || 0,
     status: (t.status as Token["status"]) || "DEAD",
-    deathCause: t.death_cause || "Unknown",
+    deathCause: t.death_cause || "Scanning...",
   };
 }
 
@@ -130,9 +139,10 @@ export async function getStats(): Promise<Stats> {
   const d: ApiStatsResponse = await res.json();
   return {
     scanned: d.tokens_scanned,
-    deaths: d.deaths_today,
+    deaths: d.dead + d.zombies_detected,
     zombies: d.zombies_detected,
-    lifespan: "—",
+    dying: d.dying,
+    alive: d.alive,
     stranded: d.total_holders_stranded
       ? d.total_holders_stranded > 1_000_000
         ? `${(d.total_holders_stranded / 1_000_000).toFixed(1)}M`

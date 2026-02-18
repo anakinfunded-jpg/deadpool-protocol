@@ -10,7 +10,7 @@ import { ScoreBar } from "@/components/score-bar";
 import { TokenCardSkeleton } from "@/components/skeleton";
 import clsx from "clsx";
 
-const FILTERS = ["ALL", "DEAD", "ZOMBIE"] as const;
+const FILTERS = ["ALL", "DEAD", "ZOMBIE", "DYING", "FADING", "ALIVE"] as const;
 
 export default function FeedPage() {
   const [filter, setFilter] = useState<string>("ALL");
@@ -71,39 +71,47 @@ export default function FeedPage() {
                 </div>
               </div>
             )
-            : tokens.map((t, i) => (
-              <Reveal key={t.address} delay={i * 0.04}>
-                <MagCard className="p-4 px-5 rounded-xl border border-white/[0.06] bg-white/[0.015] grid grid-cols-[1fr_auto] gap-4 items-center">
-                  <div>
-                    <div className="flex items-center gap-2.5 mb-1.5">
-                      <span className="text-[15px] font-bold text-white font-display">
-                        {t.name}
-                      </span>
-                      <span className="text-xs text-white/25 font-mono">
-                        ${t.symbol}
-                      </span>
-                      <StatusPill status={t.status} />
+            : tokens.map((t, i) => {
+              const isDead = t.status === "DEAD" || t.status === "ZOMBIE";
+              const score = isDead ? t.zombieScore : t.healthScore;
+              const scoreLabel = isDead ? "Z-SCORE" : "HEALTH";
+              const timeLabel = isDead ? "died" : "age";
+              return (
+                <Reveal key={t.address} delay={i * 0.04}>
+                  <MagCard className="p-4 px-5 rounded-xl border border-white/[0.06] bg-white/[0.015] grid grid-cols-[1fr_auto] gap-4 items-center">
+                    <div>
+                      <div className="flex items-center gap-2.5 mb-1.5 flex-wrap">
+                        <span className="text-[15px] font-bold text-white font-display">
+                          {t.name}
+                        </span>
+                        <span className="text-xs text-white/25 font-mono">
+                          ${t.symbol}
+                        </span>
+                        <StatusPill status={t.status} />
+                      </div>
+                      <div className="flex gap-4 flex-wrap text-xs text-white/25 font-mono">
+                        <span>{t.address.slice(0, 8)}...</span>
+                        <span>{timeLabel} {t.diedAgo}</span>
+                        <span>{t.holders} holders</span>
+                        <span>Peak {t.peakMcap}</span>
+                        <span>Liq {t.residualLiq}</span>
+                      </div>
+                      {t.deathCause && t.deathCause !== "Scanning..." && (
+                        <div className="text-xs text-white/[0.18] mt-1 font-body">
+                          {t.deathCause}
+                        </div>
+                      )}
                     </div>
-                    <div className="flex gap-4 flex-wrap text-xs text-white/25 font-mono">
-                      <span>{t.address.slice(0, 8)}...</span>
-                      <span>{t.diedAgo} ago</span>
-                      <span>{t.holders} holders</span>
-                      <span>Peak {t.peakMcap}</span>
-                      <span>Liq {t.residualLiq}</span>
+                    <div>
+                      <ScoreBar score={score} />
+                      <div className="text-[10px] text-white/[0.15] font-mono text-right mt-1">
+                        {scoreLabel}
+                      </div>
                     </div>
-                    <div className="text-xs text-white/[0.18] mt-1 font-body">
-                      {t.deathCause}
-                    </div>
-                  </div>
-                  <div>
-                    <ScoreBar score={t.zombieScore} />
-                    <div className="text-[10px] text-white/[0.15] font-mono text-right mt-1">
-                      Z-SCORE
-                    </div>
-                  </div>
-                </MagCard>
-              </Reveal>
-            ))}
+                  </MagCard>
+                </Reveal>
+              );
+            })}
       </div>
     </div>
   );
